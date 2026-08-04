@@ -1,0 +1,176 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Order\KafkaMessaging;
+
+use Order\KafkaMessaging\Contracts\ConsumerDriverInterface;
+use Order\KafkaMessaging\Contracts\IdempotencyStoreInterface;
+use Order\KafkaMessaging\Contracts\ProducerDriverInterface;
+use Psr\Log\LoggerInterface;
+use Psr\Log\NullLogger;
+
+/**
+ * Fluent consumer entry point (03-message-envelope.md §5):
+ *
+ *   KafkaConsumer::group('svc-payment')
+ *       ->driver($driver)
+ *       ->subscribe(['order.events'])
+ *       ->onEvent('OrderCreatedEvent', $handler)
+ *       ->withIdempotency($store)
+ *       ->withRetryAndDlq($producerDriver)
+ *       ->run();
+ */
+final class KafkaConsumer
+{
+    /** @var list<string> */
+    private array $topics = [];
+
+    /** @var array<string, callable(Envelope): void> */
+    private array $handlers = [];
+
+    private ?ConsumerDriverInterface $driver = null;
+    private ?IdempotencyStoreInterface $idempotency = null;
+    private ?ProducerDriverInterface $escalationProducer = null;
+    private RetryPolicy $retryPolicy;
+    private LoggerInterface $logger;
+
+    private function __construct(private readonly string $group)
+    {
+        $this->retryPolicy = new RetryPolicy();
+        $this->logger = new NullLogger();
+    }
+
+    public static function group(string $group): self
+    {
+        if (trim($group) === '') {
+            throw new \InvalidArgumentException('Consumer group must not be empty.');
+        }
+
+        return new self(trim($group));
+    }
+
+    public function driver(ConsumerDriverInterface $driver): self
+    {
+        $this->driver = $driver;
+
+        return $this;
+    }
+
+    /**
+     * @param list<string> $topics
+     */
+    public function subscribe(array $topics): self
+    {
+        $this->topics = array_values(array_unique(array_merge($this->topics, $topics)));
+
+        return $this;
+    }
+
+    /**
+     * @param callable(Envelope): void $handler
+     */
+    public function onEvent(string $eventType, callable $handler): self
+    {
+        $this->handlers[$eventType] = $handler;
+
+        return $this;
+    }
+
+    public function withIdempotency(IdempotencyStoreInterface $store): self
+    {
+        $this->idempotency = $store;
+
+        return $this;
+    }
+
+    public function withRetryAndDlq(ProducerDriverInterface $escalationProducer, ?RetryPolicy $policy = null): self
+    {
+        $this->escalationProducer = $escalationProducer;
+        if ($policy !== null) {
+            $this->retryPolicy = $policy;
+        }
+
+        return $this;
+    }
+
+    public function logger(LoggerInterface $logger): self
+    {
+        $this->logger = $logger;
+
+        return $this;
+    }
+
+    private bool $shouldStop = false;
+
+    /**
+     * Graceful shutdown — service daemons wire this to SIGTERM/SIGINT
+     * (pcntl_async_signals(true) + pcntl_signal(SIGTERM, fn () => $c->stop())).
+     */
+    public function stop(): void
+    {
+        $this->shouldStop = true;
+    }
+
+    /**
+     * Poll and process. With $exitOnIdle=true (default, batch/test mode) the
+     * loop ends on the first empty poll; with false it keeps polling until
+     * stop() — the long-running daemon the migration plan describes.
+     * Returns per-outcome counts.
+     *
+     * Commit policy: every outcome commits EXCEPT EscalationFailed — there the
+     * message survives only behind its offset, so the loop stops without
+     * committing and Kafka redelivers (idempotency skips the processed prefix).
+     *
+     * @return array<string, int>
+     */
+    public function run(?int $maxMessages = null, int $pollTimeoutMs = 1000, bool $exitOnIdle = true): array
+    {
+        if ($this->driver === null) {
+            throw new \LogicException('No consumer driver configured — call driver() first.');
+        }
+        if ($this->topics === []) {
+            throw new \LogicException('No topics to subscribe to — call subscribe() first.');
+        }
+
+        $processor = new MessageProcessor(
+            consumerGroup: $this->group,
+            idempotency: $this->idempotency,
+            escalationProducer: $this->escalationProducer,
+            retryPolicy: $this->retryPolicy,
+            logger: $this->logger,
+        );
+        foreach ($this->handlers as $eventType => $handler) {
+            $processor->onEvent($eventType, $handler);
+        }
+
+        $this->driver->subscribe($this->group, $this->topics);
+
+        $counts = [];
+        $processed = 0;
+
+        while (!$this->shouldStop && ($maxMessages === null || $processed < $maxMessages)) {
+            $message = $this->driver->poll($pollTimeoutMs);
+            if ($message === null) {
+                if ($exitOnIdle) {
+                    break;
+                }
+                continue;
+            }
+
+            $outcome = $processor->process($message);
+            $counts[$outcome->value] = ($counts[$outcome->value] ?? 0) + 1;
+            $processed++;
+
+            if (!$outcome->isCommittable()) {
+                // Do not advance past a message that exists nowhere else —
+                // stop the loop and let redelivery re-drive it.
+                break;
+            }
+
+            $this->driver->commit($message);
+        }
+
+        return $counts;
+    }
+}

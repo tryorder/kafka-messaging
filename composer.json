@@ -1,0 +1,42 @@
+{
+    "name": "order/kafka-messaging",
+    "description": "Unified Kafka messaging library for the order platform: envelope, producer, consumer, idempotency, retry/DLQ. Replaces the SNS + apigateway relay path (see kafka-test migration plan).",
+    "type": "library",
+    "license": "proprietary",
+    "require": {
+        "php": ">=8.1",
+        "psr/log": "^1.1|^2.0|^3.0",
+        "ext-json": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.5"
+    },
+    "suggest": {
+        "ext-rdkafka": "Required for the real Kafka driver (production). The core works with in-memory/log drivers without it.",
+        "ext-pdo": "For PdoIdempotencyStore (the processed_messages table).",
+        "illuminate/support": "For the Laravel service provider (auto-discovered)."
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Order\\KafkaMessaging\\Laravel\\KafkaMessagingServiceProvider"
+            ]
+        }
+    },
+    "autoload": {
+        "psr-4": {
+            "Order\\KafkaMessaging\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Order\\KafkaMessaging\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit"
+    },
+    "config": {
+        "sort-packages": true
+    }
+}
