@@ -8,17 +8,17 @@
 
 ## المنتِج (بديل `SendDataToServiceWithSNSListener`)
 
+في مسار طلب العميل استخدم `safePublish` — عمرها ما ترمي exception (فشل الرسالة لا يفشل الأوردر، وSNS يظل مصدر الحقيقة أثناء الـ dual-write). الـ `tenant` إلزامي لأنه الـ partition key، والـ `key` المركّب للـ topics الحرجة لازم يبدأ بالـ tenant:
+
 ```php
 use Order\KafkaMessaging\KafkaProducer;
 
-// في مسار طلب العميل استخدم safePublish — عمرها ما ترمي exception
-// (فشل الرسالة لا يفشل الأوردر — وSNS يظل مصدر الحقيقة أثناء الـ dual-write):
 $producer->safePublish(
     topic: 'order.events',
     eventType: 'OrderCreatedEvent',
-    tenant: $tenant,                    // إلزامي — ده الـ partition key
+    tenant: $tenant,                    // mandatory — the partition key
     data: $payload,
-    key: "{$tenant}:{$orderId}",       // للـ topics الحرجة (لازم يبدأ بالـ tenant)
+    key: "{$tenant}:{$orderId}",       // critical topics: must start with tenant
 );
 ```
 
@@ -26,17 +26,19 @@ $producer->safePublish(
 
 ## المستهلك (بديل `SNSController::__invoke` + الـ Redis worker)
 
+الـ idempotency **إلزامي قبل أي cutover**، والـ retry/DLQ بيتسموا تلقائيًا `svc-payment.order.events.retry` / `.dlq`، و`run(exitOnIdle: false)` هو وضع الـ daemon (مع `stop()` للـ SIGTERM):
+
 ```php
 use Order\KafkaMessaging\KafkaConsumer;
 
 KafkaConsumer::group('svc-payment')
-    ->driver($driver)                          // rdkafka لاحقًا / InMemory للاختبارات
+    ->driver($driver)                          // RdKafkaConsumerDriver in prod, InMemory in tests
     ->subscribe(['order.events'])
     ->onEvent('OrderCreatedEvent', CheckPaymentHandler::class)
-    ->withIdempotency($store)                  // إلزامي قبل أي cutover
-    ->withRetryAndDlq($producerDriver)         // svc-payment.order.events.retry / .dlq
+    ->withIdempotency($store)
+    ->withRetryAndDlq($producerDriver)
     ->logger($logger)
-    ->run(exitOnIdle: false);                  // daemon mode + stop() للـ SIGTERM
+    ->run(exitOnIdle: false);
 ```
 
 ## سياسة الفشل (مُراجعة ومقصودة)
@@ -54,8 +56,9 @@ KafkaConsumer::group('svc-payment')
 
 ## الـ Idempotency
 
+جدول `processed_messages` (مواصفة `03-message-envelope.md §3` في خطة الهجرة) — الـ migration دي بتتعمل في كل خدمة:
+
 ```php
-// جدول processed_messages (03-message-envelope.md §3) — migration في كل خدمة:
 Schema::create('processed_messages', function (Blueprint $t) {
     $t->string('consumer_group', 191);
     $t->string('message_id', 191);
@@ -70,8 +73,9 @@ $store = new PdoIdempotencyStore(DB::connection()->getPdo());
 
 ## جسر SNS (للـ dual-write)
 
+نفس الحدث المنطقي = نفس `message_id` على المسارين → الـ dedupe بيشتغل عبرهما:
+
 ```php
-// نفس الحدث المنطقي = نفس message_id على المسارين → الـ dedupe يشتغل عبرهما
 $envelope = SnsBridge::toEnvelope($subject, $decodedSnsMessage, 'service-order', $snsMessageId, $snsTimestamp);
 ```
 
@@ -81,10 +85,12 @@ $envelope = SnsBridge::toEnvelope($subject, $decodedSnsMessage, 'service-order',
 
 Auto-discovery عبر `KafkaMessagingServiceProvider`. لكل خدمة:
 
+`KAFKA_SOURCE_SERVICE` إلزامي (الـ provider بيرفض يشتغل من غيره)، و`driver=log` هو الـ shadow mode الافتراضي الآمن، و`KAFKA_DUAL_WRITE` بيتقلب `true` في المرحلة 1:
+
 ```env
-KAFKA_SOURCE_SERVICE=service-order   # إلزامي
-KAFKA_MESSAGING_DRIVER=log           # shadow mode — الافتراضي الآمن
-KAFKA_DUAL_WRITE=false               # يتقلب true في المرحلة 1
+KAFKA_SOURCE_SERVICE=service-order
+KAFKA_MESSAGING_DRIVER=log
+KAFKA_DUAL_WRITE=false
 KAFKA_CONSUMER_GROUP=svc-order
 ```
 
