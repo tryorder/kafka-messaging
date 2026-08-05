@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Order\KafkaMessaging\Drivers;
 
+use Order\KafkaMessaging\BrokerConfig;
 use Order\KafkaMessaging\Contracts\ProducerDriverInterface;
 use Order\KafkaMessaging\Exceptions\PublishFailedException;
 
@@ -28,10 +29,11 @@ final class RdKafkaProducerDriver implements ProducerDriverInterface
     private ?string $lastDeliveryError = null;
 
     /**
+     * @param BrokerConfig|string $brokers a full BrokerConfig (SASL/SSL aware) or a bare broker list
      * @param array<string, string> $extraConf raw librdkafka overrides
      */
     public function __construct(
-        string $brokers,
+        BrokerConfig|string $brokers,
         private readonly int $flushTimeoutMs = 10000,
         array $extraConf = [],
     ) {
@@ -41,8 +43,12 @@ final class RdKafkaProducerDriver implements ProducerDriverInterface
             );
         }
 
+        $broker = is_string($brokers) ? new BrokerConfig($brokers) : $brokers;
+
         $conf = new \RdKafka\Conf();
-        $conf->set('bootstrap.servers', $brokers);
+        foreach ($broker->toLibrdKafkaConf() as $key => $value) {
+            $conf->set($key, $value);
+        }
         $conf->set('acks', 'all');
         $conf->set('enable.idempotence', 'true');
         // No producer-side compression: zstd inside php-fpm was implicated in

@@ -32,6 +32,13 @@ final class KafkaConsumer
     private ?ConsumerDriverInterface $driver = null;
     private ?IdempotencyStoreInterface $idempotency = null;
     private ?ProducerDriverInterface $escalationProducer = null;
+    private ?\Order\KafkaMessaging\Contracts\ConsumerMetricsInterface $metrics = null;
+
+    /** @var list<callable(ConsumedMessage): void> */
+    private array $beforeCallbacks = [];
+
+    /** @var list<callable(ConsumedMessage, ProcessOutcome): void> */
+    private array $afterCallbacks = [];
     private RetryPolicy $retryPolicy;
     private LoggerInterface $logger;
 
@@ -97,6 +104,33 @@ final class KafkaConsumer
     public function logger(LoggerInterface $logger): self
     {
         $this->logger = $logger;
+
+        return $this;
+    }
+
+    public function withMetrics(\Order\KafkaMessaging\Contracts\ConsumerMetricsInterface $metrics): self
+    {
+        $this->metrics = $metrics;
+
+        return $this;
+    }
+
+    /**
+     * @param callable(ConsumedMessage): void $callback
+     */
+    public function before(callable $callback): self
+    {
+        $this->beforeCallbacks[] = $callback;
+
+        return $this;
+    }
+
+    /**
+     * @param callable(ConsumedMessage, ProcessOutcome): void $callback
+     */
+    public function after(callable $callback): self
+    {
+        $this->afterCallbacks[] = $callback;
 
         return $this;
     }
@@ -188,7 +222,16 @@ final class KafkaConsumer
                 }
             }
 
+            $this->fire($this->beforeCallbacks, [$message]);
+            $this->observe(fn () => $this->metrics?->beforeProcess($this->group, $message));
+
+            $startedAt = microtime(true);
             $outcome = $processor->process($message);
+            $durationMs = (microtime(true) - $startedAt) * 1000;
+
+            $this->observe(fn () => $this->metrics?->afterProcess($this->group, $message, $outcome, $durationMs));
+            $this->fire($this->afterCallbacks, [$message, $outcome]);
+
             $counts[$outcome->value] = ($counts[$outcome->value] ?? 0) + 1;
             $processed++;
 
@@ -202,5 +245,31 @@ final class KafkaConsumer
         }
 
         return $counts;
+    }
+
+    /**
+     * Observation must never break consumption — a failing metrics backend or
+     * callback is logged and swallowed.
+     *
+     * @param list<callable> $callbacks
+     * @param list<mixed> $args
+     */
+    private function fire(array $callbacks, array $args): void
+    {
+        foreach ($callbacks as $callback) {
+            $this->observe(static fn () => $callback(...$args));
+        }
+    }
+
+    private function observe(callable $fn): void
+    {
+        try {
+            $fn();
+        } catch (\Throwable $e) {
+            $this->logger->warning('Kafka observation hook failed (ignored)', ['data' => [
+                'group' => $this->group,
+                'error' => $e->getMessage(),
+            ]]);
+        }
     }
 }

@@ -81,6 +81,55 @@ $envelope = SnsBridge::toEnvelope($subject, $decodedSnsMessage, 'service-order',
 
 بيرفض بصرامة أي رسالة من publisher غير مُوحَّد (بلا `tenant` أو `data`) — راجع المرحلة 0.5 في الـ runbook.
 
+## الأمان (SASL/SSL)
+
+محليًا `PLAINTEXT`، وفي الإنتاج (AWS MSK) `SASL_SSL` — كله من الـ env، و`BrokerConfig` بيترجمها لمفاتيح librdkafka ويرفض أي إعداد ناقص **وقت الإقلاع** مش عند أول نشرة:
+
+```env
+KAFKA_SECURITY_PROTOCOL=SASL_SSL
+KAFKA_SASL_MECHANISM=SCRAM-SHA-512
+KAFKA_SASL_USERNAME=order
+KAFKA_SASL_PASSWORD=***
+KAFKA_SSL_CA_LOCATION=/etc/ssl/certs/ca.pem
+```
+
+الـ passwords بتتحجب تلقائيًا في أي لوج (`toRedactedArray`).
+
+## الـ Replay (معيار نجاح في خطة الهجرة)
+
+بيقرا بـ consumer group مؤقتة — **عمره ما يلمس offsets المجموعة الحية**:
+
+```bash
+php artisan kafka:replay order.events --since="2026-08-05 10:00" --event=OrderCreatedEvent
+php artisan kafka:replay svc-payment.order.events.dlq --to=order.events --confirm
+```
+
+من غير `--confirm` بيبقى معاينة بس. وعند إعادة الحقن بيحافظ على `message_id` (فالمستهلك بيتخطى اللي عالجه قبل كده) وبيشيل headers الـ retry عشان الرسالة تدخل نضيفة.
+
+## الاختبارات (KafkaFake)
+
+```php
+$fake = KafkaFake::bind();
+
+// ... شغّل الفلو ...
+
+$fake->assertPublished('OrderCreatedEvent')
+     ->assertPublishedOn('order.events', 'OrderCreatedEvent', fn ($m) => $m['tenant'] === 'jabourih')
+     ->assertPublishedTimes('OrderCreatedEvent', 1)
+     ->assertNotPublished('OrderCompletedEvent')
+     ->assertAllHaveTenant();
+```
+
+## المراقبة (metrics + callbacks)
+
+```php
+$consumer->withMetrics($prometheusExporter)   // ConsumerMetricsInterface
+         ->before(fn ($msg) => Log::debug('in'))
+         ->after(fn ($msg, $outcome) => Log::debug($outcome->value));
+```
+
+أي فشل في طبقة المراقبة **مش بيوقف الاستهلاك** — بيتسجل warning وبس.
+
 ## تكامل Laravel
 
 Auto-discovery عبر `KafkaMessagingServiceProvider`. لكل خدمة:

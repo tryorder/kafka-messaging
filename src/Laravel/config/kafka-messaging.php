@@ -20,6 +20,22 @@ return [
     // Broker list for the rdkafka driver (unused by log/memory).
     'brokers' => env('KAFKA_BROKERS', 'localhost:9092'),
 
+    // Connection security. Local = PLAINTEXT; AWS MSK = SASL_SSL with
+    // SCRAM-SHA-512 (credentials from Secrets Manager, never committed).
+    'security' => [
+        'protocol' => env('KAFKA_SECURITY_PROTOCOL', 'PLAINTEXT'), // PLAINTEXT|SSL|SASL_PLAINTEXT|SASL_SSL
+        'sasl_mechanism' => env('KAFKA_SASL_MECHANISM'),            // PLAIN|SCRAM-SHA-256|SCRAM-SHA-512
+        'sasl_username' => env('KAFKA_SASL_USERNAME'),
+        'sasl_password' => env('KAFKA_SASL_PASSWORD'),
+        'ssl_ca_location' => env('KAFKA_SSL_CA_LOCATION'),
+        'ssl_certificate_location' => env('KAFKA_SSL_CERT_LOCATION'),
+        'ssl_key_location' => env('KAFKA_SSL_KEY_LOCATION'),
+        'ssl_key_password' => env('KAFKA_SSL_KEY_PASSWORD'),
+    ],
+
+    // Raw librdkafka overrides, applied last (escape hatch).
+    'extra_conf' => [],
+
     'consumer' => [
         // Consumer group per service, e.g. "svc-order" (02-kafka-topics.md §4).
         'group' => env('KAFKA_CONSUMER_GROUP', ''),

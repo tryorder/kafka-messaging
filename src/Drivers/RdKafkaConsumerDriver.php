@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Order\KafkaMessaging\Drivers;
 
+use Order\KafkaMessaging\BrokerConfig;
 use Order\KafkaMessaging\ConsumedMessage;
 use Order\KafkaMessaging\Contracts\ConsumerDriverInterface;
 
@@ -20,14 +21,19 @@ final class RdKafkaConsumerDriver implements ConsumerDriverInterface
     /** @var \SplObjectStorage<ConsumedMessage, \RdKafka\Message> */
     private \SplObjectStorage $native;
 
+    private readonly BrokerConfig $broker;
+
     /**
+     * @param BrokerConfig|string $brokers a full BrokerConfig (SASL/SSL aware) or a bare broker list
      * @param array<string, string> $extraConf raw librdkafka overrides
      */
     public function __construct(
-        private readonly string $brokers,
+        BrokerConfig|string $brokers,
         private readonly string $offsetReset = 'earliest',
         private readonly array $extraConf = [],
     ) {
+        $this->broker = is_string($brokers) ? new BrokerConfig($brokers) : $brokers;
+
         if (!extension_loaded('rdkafka')) {
             throw new \RuntimeException(
                 'ext-rdkafka is not loaded. Install: brew install librdkafka && pecl install rdkafka'
@@ -40,7 +46,9 @@ final class RdKafkaConsumerDriver implements ConsumerDriverInterface
     public function subscribe(string $group, array $topics): void
     {
         $conf = new \RdKafka\Conf();
-        $conf->set('bootstrap.servers', $this->brokers);
+        foreach ($this->broker->toLibrdKafkaConf() as $key => $value) {
+            $conf->set($key, $value);
+        }
         $conf->set('group.id', $group);
         $conf->set('enable.auto.commit', 'false');
         $conf->set('auto.offset.reset', $this->offsetReset);

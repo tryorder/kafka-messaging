@@ -52,7 +52,7 @@ final class KafkaMessagingServiceProvider extends ServiceProvider
                 }
 
                 return new RdKafkaProducerDriver(
-                    (string) $app['config']['kafka-messaging.brokers'],
+                    \Order\KafkaMessaging\BrokerConfig::fromArray((array) $app['config']['kafka-messaging']),
                 );
             }
 
@@ -92,7 +92,10 @@ final class KafkaMessagingServiceProvider extends ServiceProvider
         ], 'kafka-messaging-config');
 
         if ($this->app->runningInConsole()) {
-            $this->commands([Commands\KafkaConsumeCommand::class]);
+            $this->commands([
+                Commands\KafkaConsumeCommand::class,
+                Commands\KafkaReplayCommand::class,
+            ]);
         }
     }
 }
