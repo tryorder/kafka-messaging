@@ -45,7 +45,9 @@ final class RdKafkaProducerDriver implements ProducerDriverInterface
         $conf->set('bootstrap.servers', $brokers);
         $conf->set('acks', 'all');
         $conf->set('enable.idempotence', 'true');
-        $conf->set('compression.type', 'zstd');
+        // No producer-side compression: zstd inside php-fpm was implicated in
+        // SIGABRT worker crashes (2026-08-05); the topics carry
+        // compression.type=zstd broker-side anyway, so nothing is lost.
         $conf->set('socket.timeout.ms', '5000');
         $conf->set('message.timeout.ms', (string) $this->flushTimeoutMs);
         foreach ($extraConf as $k => $v) {
@@ -85,13 +87,4 @@ final class RdKafkaProducerDriver implements ProducerDriverInterface
         }
     }
 
-    public function __destruct()
-    {
-        // Best effort: drain anything still queued so a dying process does
-        // not silently drop acknowledged-to-caller messages (there are none
-        // in sync mode, but extraConf could have disabled per-send flushing).
-        if (isset($this->producer)) {
-            $this->producer->flush(1000);
-        }
-    }
 }
