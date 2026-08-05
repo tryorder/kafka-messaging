@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace Order\KafkaMessaging\Drivers;
 
 use Order\KafkaMessaging\BrokerConfig;
-use Order\KafkaMessaging\Contracts\ProducerDriverInterface;
+use Order\KafkaMessaging\Contracts\BatchProducerDriverInterface;
 use Order\KafkaMessaging\Exceptions\PublishFailedException;
 
 /**
@@ -19,7 +19,7 @@ use Order\KafkaMessaging\Exceptions\PublishFailedException;
  * the broker acknowledged delivery. Correctness over throughput — dual-write
  * volumes are modest; batching can come later behind the same interface.
  */
-final class RdKafkaProducerDriver implements ProducerDriverInterface
+final class RdKafkaProducerDriver implements BatchProducerDriverInterface
 {
     private \RdKafka\Producer $producer;
 
@@ -27,6 +27,11 @@ final class RdKafkaProducerDriver implements ProducerDriverInterface
     private array $topics = [];
 
     private ?string $lastDeliveryError = null;
+
+    /** @var list<string> collected per-message delivery errors during a batch */
+    private array $batchErrors = [];
+
+    private bool $collectingBatch = false;
 
     /**
      * @param BrokerConfig|string $brokers a full BrokerConfig (SASL/SSL aware) or a bare broker list
@@ -64,8 +69,16 @@ final class RdKafkaProducerDriver implements ProducerDriverInterface
         // signal in librdkafka's async model — flush() alone can return OK
         // while an individual message failed.
         $conf->setDrMsgCb(function (\RdKafka\Producer $producer, \RdKafka\Message $message): void {
-            if ($message->err !== RD_KAFKA_RESP_ERR_NO_ERROR) {
-                $this->lastDeliveryError = rd_kafka_err2str($message->err);
+            if ($message->err === RD_KAFKA_RESP_ERR_NO_ERROR) {
+                return;
+            }
+
+            $error = rd_kafka_err2str($message->err);
+            $this->lastDeliveryError = $error;
+
+            if ($this->collectingBatch) {
+                // opaque carries the message's index within the batch
+                $this->batchErrors[] = ($message->opaque ?? '?') . '|' . $error;
             }
         });
 
@@ -90,6 +103,57 @@ final class RdKafkaProducerDriver implements ProducerDriverInterface
             throw new PublishFailedException(
                 "Kafka delivery failed for topic '{$topic}': {$this->lastDeliveryError}"
             );
+        }
+    }
+
+    public function sendBatch(string $topic, array $messages): array
+    {
+        if ($messages === []) {
+            return [];
+        }
+
+        $this->batchErrors = [];
+        $this->collectingBatch = true;
+        $topicHandle = $this->topics[$topic] ??= $this->producer->newTopic($topic);
+
+        try {
+            foreach (array_values($messages) as $i => $message) {
+                // opaque = the batch index, so the delivery report can name
+                // exactly which message failed rather than failing the lot.
+                $topicHandle->producev(
+                    RD_KAFKA_PARTITION_UA,
+                    0,
+                    $message['payload'],
+                    $message['key'],
+                    $message['headers'],
+                    null,
+                    (string) $i,
+                );
+            }
+
+            $result = $this->producer->flush($this->flushTimeoutMs);
+
+            if ($result !== RD_KAFKA_RESP_ERR_NO_ERROR) {
+                // The flush itself timed out: report every message as failed
+                // rather than pretending a partial success we cannot verify.
+                $error = 'flush failed: ' . rd_kafka_err2str($result);
+
+                return array_map(
+                    static fn (int $i): array => ['index' => $i, 'error' => $error],
+                    range(0, count($messages) - 1)
+                );
+            }
+
+            $failures = [];
+            foreach ($this->batchErrors as $entry) {
+                [$index, $error] = explode('|', $entry, 2);
+                $failures[] = ['index' => (int) $index, 'error' => $error];
+            }
+
+            return $failures;
+        } finally {
+            $this->collectingBatch = false;
+            $this->batchErrors = [];
         }
     }
 

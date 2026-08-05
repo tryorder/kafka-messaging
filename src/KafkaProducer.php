@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Order\KafkaMessaging;
 
+use Order\KafkaMessaging\Contracts\BatchProducerDriverInterface;
 use Order\KafkaMessaging\Contracts\ProducerDriverInterface;
 use Order\KafkaMessaging\Exceptions\PublishFailedException;
 use Psr\Log\LoggerInterface;
@@ -59,11 +60,7 @@ final class KafkaProducer
         // (02-kafka-topics.md §3). A caller-supplied key that drops the tenant
         // prefix would silently break per-tenant ordering, so it is rejected.
         $key ??= $envelope->tenant;
-        if ($key !== $envelope->tenant && !str_starts_with($key, $envelope->tenant . ':')) {
-            throw new PublishFailedException(
-                "Partition key '{$key}' must be the tenant or start with '{$envelope->tenant}:'."
-            );
-        }
+        $this->assertKeyMatchesTenant($key, $envelope->tenant);
 
         try {
             $this->driver->send($topic, $key, $envelope->toHeaders(), $envelope->toPayload());
@@ -74,6 +71,111 @@ final class KafkaProducer
         }
 
         return $envelope;
+    }
+
+    /**
+     * Publish many messages to one topic with a single broker round trip
+     * (when the driver supports batching; otherwise sequentially).
+     *
+     * One bad message does not discard the batch: envelope-building and
+     * delivery failures are reported per index instead of thrown.
+     *
+     * @param list<array{eventType: string, tenant: string, data: array<string, mixed>, key?: string|null, traceId?: string|null, schemaVersion?: int, messageId?: string|null, eventTime?: string|null}> $messages
+     */
+    public function publishBatch(string $topic, array $messages): BatchResult
+    {
+        $prepared = [];   // wire messages for the driver
+        $envelopes = [];  // parallel to $prepared
+        $indexes = [];    // driver index → original input index
+        $failures = [];
+
+        foreach (array_values($messages) as $i => $message) {
+            try {
+                $envelope = Envelope::create(
+                    tenant: (string) ($message['tenant'] ?? ''),
+                    data: (array) ($message['data'] ?? []),
+                    eventType: (string) ($message['eventType'] ?? ''),
+                    sourceService: $this->sourceService,
+                    messageId: $message['messageId'] ?? null,
+                    eventTime: $message['eventTime'] ?? null,
+                    schemaVersion: (int) ($message['schemaVersion'] ?? 1),
+                    traceId: $message['traceId'] ?? null,
+                );
+
+                $key = $message['key'] ?? $envelope->tenant;
+                $this->assertKeyMatchesTenant($key, $envelope->tenant);
+
+                $indexes[] = $i;
+                $envelopes[] = $envelope;
+                $prepared[] = ['key' => $key, 'headers' => $envelope->toHeaders(), 'payload' => $envelope->toPayload()];
+            } catch (\Throwable $e) {
+                $failures[] = ['index' => $i, 'error' => $e->getMessage()];
+            }
+        }
+
+        if ($prepared === []) {
+            return new BatchResult([], $failures);
+        }
+
+        $driverFailures = $this->driver instanceof BatchProducerDriverInterface
+            ? $this->driver->sendBatch($topic, $prepared)
+            : $this->sendSequentially($topic, $prepared);
+
+        // Map driver-relative indexes back to the caller's input indexes.
+        $failedDriverIndexes = [];
+        foreach ($driverFailures as $failure) {
+            $failedDriverIndexes[$failure['index']] = true;
+            $failures[] = ['index' => $indexes[$failure['index']] ?? $failure['index'], 'error' => $failure['error']];
+        }
+
+        $delivered = [];
+        foreach ($envelopes as $driverIndex => $envelope) {
+            if (!isset($failedDriverIndexes[$driverIndex])) {
+                $delivered[] = $envelope;
+            }
+        }
+
+        if ($failures !== []) {
+            $this->logger->error('Kafka batch publish had failures', ['data' => [
+                'topic' => $topic,
+                'attempted' => count($messages),
+                'delivered' => count($delivered),
+                'failed' => count($failures),
+                'errors' => array_slice($failures, 0, 10),
+            ]]);
+        }
+
+        usort($failures, static fn (array $a, array $b): int => $a['index'] <=> $b['index']);
+
+        return new BatchResult($delivered, $failures);
+    }
+
+    /**
+     * @param list<array{key: string, headers: array<string, string>, payload: string}> $messages
+     *
+     * @return list<array{index: int, error: string}>
+     */
+    private function sendSequentially(string $topic, array $messages): array
+    {
+        $failures = [];
+        foreach ($messages as $i => $message) {
+            try {
+                $this->driver->send($topic, $message['key'], $message['headers'], $message['payload']);
+            } catch (\Throwable $e) {
+                $failures[] = ['index' => $i, 'error' => $e->getMessage()];
+            }
+        }
+
+        return $failures;
+    }
+
+    private function assertKeyMatchesTenant(string $key, string $tenant): void
+    {
+        if ($key !== $tenant && !str_starts_with($key, $tenant . ':')) {
+            throw new PublishFailedException(
+                "Partition key '{$key}' must be the tenant or start with '{$tenant}:'."
+            );
+        }
     }
 
     /**

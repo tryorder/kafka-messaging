@@ -34,6 +34,9 @@ final class KafkaConsumer
     private ?ProducerDriverInterface $escalationProducer = null;
     private ?\Order\KafkaMessaging\Contracts\ConsumerMetricsInterface $metrics = null;
 
+    /** @var list<callable(Envelope, \Closure): mixed> */
+    private array $middleware = [];
+
     /** @var list<callable(ConsumedMessage): void> */
     private array $beforeCallbacks = [];
 
@@ -80,6 +83,19 @@ final class KafkaConsumer
     public function onEvent(string $eventType, callable $handler): self
     {
         $this->handlers[$eventType] = $handler;
+
+        return $this;
+    }
+
+    /**
+     * Wrap handler execution: fn (Envelope $e, Closure $next) => $next($e).
+     * Useful for tenant context, timing, or conditionally skipping messages.
+     *
+     * @param callable(Envelope, \Closure): mixed $middleware
+     */
+    public function middleware(callable $middleware): self
+    {
+        $this->middleware[] = $middleware;
 
         return $this;
     }
@@ -191,6 +207,9 @@ final class KafkaConsumer
             retryPolicy: $this->retryPolicy,
             logger: $this->logger,
         );
+        foreach ($this->middleware as $middleware) {
+            $processor->middleware($middleware);
+        }
         foreach ($this->handlers as $eventType => $handler) {
             $processor->onEvent($eventType, $handler);
         }

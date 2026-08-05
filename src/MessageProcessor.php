@@ -42,6 +42,9 @@ final class MessageProcessor
     /** @var array<string, callable(Envelope): void> */
     private array $handlers = [];
 
+    /** @var list<callable(Envelope, \Closure): mixed> */
+    private array $middleware = [];
+
     public function __construct(
         private readonly string $consumerGroup,
         private readonly ?IdempotencyStoreInterface $idempotency = null,
@@ -62,6 +65,41 @@ final class MessageProcessor
         $this->handlers[$eventType] = $handler;
 
         return $this;
+    }
+
+    /**
+     * Wrap handler execution: fn (Envelope $e, Closure $next) => $next($e).
+     * Not calling $next skips the message (it still counts as Processed).
+     * Middleware run in registration order, outermost first.
+     *
+     * @param callable(Envelope, \Closure): mixed $middleware
+     */
+    public function middleware(callable $middleware): self
+    {
+        $this->middleware[] = $middleware;
+
+        return $this;
+    }
+
+    /**
+     * @param callable(Envelope): void $handler
+     */
+    private function throughMiddleware(Envelope $envelope, callable $handler): void
+    {
+        $pipeline = static function (Envelope $e) use ($handler): void {
+            $handler($e);
+        };
+
+        foreach (array_reverse($this->middleware) as $middleware) {
+            $next = $pipeline;
+            $pipeline = static function (Envelope $e) use ($middleware, $next): void {
+                $middleware($e, static function (?Envelope $passed = null) use ($next, $e): void {
+                    $next($passed ?? $e);
+                });
+            };
+        }
+
+        $pipeline($envelope);
     }
 
     public function process(ConsumedMessage $message): ProcessOutcome
@@ -111,7 +149,7 @@ final class MessageProcessor
         $lastError = null;
         for ($attempt = 1; $attempt <= $this->retryPolicy->immediateAttempts; $attempt++) {
             try {
-                $handler($envelope);
+                $this->throughMiddleware($envelope, $handler);
             } catch (\Throwable $e) {
                 $lastError = $e;
                 continue;
