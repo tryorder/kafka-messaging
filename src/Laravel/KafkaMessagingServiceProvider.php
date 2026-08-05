@@ -31,13 +31,32 @@ final class KafkaMessagingServiceProvider extends ServiceProvider
         $this->mergeConfigFrom(__DIR__ . '/config/kafka-messaging.php', 'kafka-messaging');
 
         $this->app->singleton(ProducerDriverInterface::class, function ($app) {
-            return match ($app['config']['kafka-messaging.driver']) {
-                'memory' => new InMemoryProducerDriver(),
-                'rdkafka' => new RdKafkaProducerDriver(
+            $driver = $app['config']['kafka-messaging.driver'];
+
+            if ($driver === 'memory') {
+                return new InMemoryProducerDriver();
+            }
+
+            if ($driver === 'rdkafka') {
+                // Order-survival rule: a missing/unloaded extension (e.g.
+                // php-fpm not restarted since pecl install) must NEVER 500 the
+                // caller's request. Fall back to the shadow log driver and
+                // scream in the logs instead.
+                if (!extension_loaded('rdkafka')) {
+                    $app['log']->error('kafka-messaging: driver=rdkafka but ext-rdkafka is not loaded in this runtime — falling back to the log driver', ['data' => [
+                        'sapi' => PHP_SAPI,
+                        'hint' => 'restart php-fpm to load the extension for web requests',
+                    ]]);
+
+                    return new LogProducerDriver($app['log']);
+                }
+
+                return new RdKafkaProducerDriver(
                     (string) $app['config']['kafka-messaging.brokers'],
-                ),
-                default => new LogProducerDriver($app['log']),
-            };
+                );
+            }
+
+            return new LogProducerDriver($app['log']);
         });
 
         $this->app->singleton(KafkaProducer::class, function ($app) {
