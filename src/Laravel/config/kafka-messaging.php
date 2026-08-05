@@ -23,6 +23,16 @@ return [
     'consumer' => [
         // Consumer group per service, e.g. "svc-order" (02-kafka-topics.md §4).
         'group' => env('KAFKA_CONSUMER_GROUP', ''),
+
+        // Topics this service subscribes to, e.g. ['order.events', 'user.events'].
+        // The retry daemon (kafka:consume --retry) derives
+        // "<group>.<topic>.retry" from the same list.
+        'topics' => [],
+
+        // event_type => handler class. Resolved from the container;
+        // handle(Envelope) or __invoke(Envelope) both work.
+        // e.g. 'OrderCreatedEvent' => \App\Kafka\Handlers\OrderCreatedHandler::class,
+        'handlers' => [],
     ],
 
     'idempotency' => [

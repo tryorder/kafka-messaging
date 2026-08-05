@@ -102,6 +102,23 @@ final class KafkaConsumer
     }
 
     private bool $shouldStop = false;
+    private bool $honorRetryDelays = false;
+
+    /** @var callable(int): void */
+    private $sleeper = null;
+
+    /**
+     * Retry-daemon mode: before processing a message carrying
+     * x-retry-not-before in the future, park until it becomes eligible.
+     * Blocking the (dedicated) retry partition is the intended pattern.
+     */
+    public function honorRetryDelays(?callable $sleeper = null): self
+    {
+        $this->honorRetryDelays = true;
+        $this->sleeper = $sleeper;
+
+        return $this;
+    }
 
     /**
      * Graceful shutdown — service daemons wire this to SIGTERM/SIGINT
@@ -156,6 +173,19 @@ final class KafkaConsumer
                     break;
                 }
                 continue;
+            }
+
+            if ($this->honorRetryDelays) {
+                $remaining = (int) ($message->headers[MessageProcessor::HEADER_RETRY_NOT_BEFORE] ?? 0) - time();
+                if ($remaining > 0) {
+                    ($this->sleeper ?? static fn (int $s) => sleep($s))($remaining);
+                }
+                if ($this->shouldStop) {
+                    // Interrupted mid-park (SIGTERM breaks sleep with
+                    // pcntl_async_signals): leave WITHOUT processing or
+                    // committing — redelivery re-parks it.
+                    break;
+                }
             }
 
             $outcome = $processor->process($message);

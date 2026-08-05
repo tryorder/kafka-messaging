@@ -35,6 +35,7 @@ final class MessageProcessor
 {
     public const HEADER_RETRY_ROUND = 'x-retry-round';
     public const HEADER_RETRY_DELAY = 'x-retry-delay-seconds';
+    public const HEADER_RETRY_NOT_BEFORE = 'x-retry-not-before';
     public const HEADER_ORIGINAL_TOPIC = 'x-original-topic';
     public const HEADER_LAST_ERROR = 'x-last-error';
 
@@ -270,8 +271,12 @@ final class MessageProcessor
         $headers[self::HEADER_LAST_ERROR] = mb_substr($error, 0, 500);
 
         if ($nextRound !== null) {
+            $delay = $this->retryPolicy->delayForRound($nextRound);
             $headers[self::HEADER_RETRY_ROUND] = (string) $nextRound;
-            $headers[self::HEADER_RETRY_DELAY] = (string) $this->retryPolicy->delayForRound($nextRound);
+            $headers[self::HEADER_RETRY_DELAY] = (string) $delay;
+            // Absolute eligibility timestamp — the retry daemon parks the
+            // partition until this instant (honorRetryDelays()).
+            $headers[self::HEADER_RETRY_NOT_BEFORE] = (string) (time() + $delay);
         }
 
         try {

@@ -257,6 +257,62 @@ final class ReviewFixesTest extends TestCase
         $this->assertSame('2026-08-04T21:00:00.000Z', $driver->messagesOn('order.events')[0]['headers']['event_time']);
     }
 
+    public function testEscalationStampsAbsoluteNotBeforeTimestamp(): void
+    {
+        $escalation = new InMemoryProducerDriver();
+        $processor = new MessageProcessor(
+            'svc-payment',
+            escalationProducer: $escalation,
+            retryPolicy: new RetryPolicy(immediateAttempts: 1, roundDelaysSeconds: [60]),
+        );
+        $processor->onEvent('OrderCreatedEvent', fn () => throw new \RuntimeException('boom'));
+
+        $before = time();
+        $processor->process($this->message());
+
+        $headers = $escalation->messagesOn('svc-payment.order.events.retry')[0]['headers'];
+        $notBefore = (int) $headers[MessageProcessor::HEADER_RETRY_NOT_BEFORE];
+        $this->assertGreaterThanOrEqual($before + 60, $notBefore);
+        $this->assertLessThanOrEqual(time() + 61, $notBefore);
+    }
+
+    public function testRetryDaemonParksUntilNotBeforeUsingInjectedSleeper(): void
+    {
+        $driver = new InMemoryConsumerDriver();
+        $handled = 0;
+        $slept = [];
+
+        // A retry-topic message eligible 40s from now.
+        $e = Envelope::create('jabourih', [], 'OrderCreatedEvent', 'service-order');
+        $driver->feed(new ConsumedMessage(
+            topic: 'svc-payment.order.events.retry',
+            key: 'jabourih',
+            headers: array_merge($e->toHeaders(), [
+                MessageProcessor::HEADER_ORIGINAL_TOPIC => 'order.events',
+                MessageProcessor::HEADER_RETRY_ROUND => '1',
+                MessageProcessor::HEADER_RETRY_NOT_BEFORE => (string) (time() + 40),
+            ]),
+            payload: $e->toPayload(),
+        ));
+
+        $counts = KafkaConsumer::group('svc-payment')
+            ->driver($driver)
+            ->subscribe(['svc-payment.order.events.retry'])
+            ->onEvent('OrderCreatedEvent', function () use (&$handled): void {
+                $handled++;
+            })
+            ->honorRetryDelays(function (int $s) use (&$slept): void {
+                $slept[] = $s;
+            })
+            ->run();
+
+        $this->assertCount(1, $slept, 'parked exactly once');
+        $this->assertGreaterThanOrEqual(38, $slept[0]);
+        $this->assertLessThanOrEqual(40, $slept[0]);
+        $this->assertSame(1, $handled, 'processed after the park');
+        $this->assertSame(['processed' => 1], $counts);
+    }
+
     public function testDaemonModeSurvivesIdlePollsAndStopsGracefully(): void
     {
         $consumerHolder = new \stdClass();

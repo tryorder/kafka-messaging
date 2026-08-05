@@ -71,5 +71,9 @@ final class KafkaMessagingServiceProvider extends ServiceProvider
         $this->publishes([
             __DIR__ . '/config/kafka-messaging.php' => $this->app->configPath('kafka-messaging.php'),
         ], 'kafka-messaging-config');
+
+        if ($this->app->runningInConsole()) {
+            $this->commands([Commands\KafkaConsumeCommand::class]);
+        }
     }
 }
