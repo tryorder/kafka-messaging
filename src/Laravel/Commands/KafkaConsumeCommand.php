@@ -33,7 +33,8 @@ final class KafkaConsumeCommand extends Command
         {--topics= : Comma-separated topics override}
         {--retry : Consume the retry topics of the configured topics, honoring delays}
         {--max-messages= : Stop after N messages (default: run forever)}
-        {--idle-exit : Exit on first idle poll instead of running as a daemon}';
+        {--idle-exit : Exit on first idle poll instead of running as a daemon}
+        {--poll-timeout=5000 : Poll timeout in ms (must exceed group-rebalance time when using --idle-exit)}';
 
     protected $description = 'Run the Kafka consumer daemon (order/kafka-messaging)';
 
@@ -92,7 +93,11 @@ final class KafkaConsumeCommand extends Command
         $this->info("kafka:consume [{$mode}] group={$group} topics=" . implode(',', $topics));
 
         $max = $this->option('max-messages') !== null ? (int) $this->option('max-messages') : null;
-        $counts = $consumer->run(maxMessages: $max, exitOnIdle: (bool) $this->option('idle-exit'));
+        $counts = $consumer->run(
+            maxMessages: $max,
+            pollTimeoutMs: max(1000, (int) $this->option('poll-timeout')),
+            exitOnIdle: (bool) $this->option('idle-exit'),
+        );
 
         foreach ($counts as $outcome => $count) {
             $this->line("  {$outcome}: {$count}");
