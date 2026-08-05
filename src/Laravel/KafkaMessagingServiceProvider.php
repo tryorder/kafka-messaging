@@ -11,6 +11,7 @@ use Order\KafkaMessaging\Drivers\InMemoryProducerDriver;
 use Order\KafkaMessaging\Drivers\LogProducerDriver;
 use Order\KafkaMessaging\InMemoryIdempotencyStore;
 use Order\KafkaMessaging\KafkaProducer;
+use Order\KafkaMessaging\Drivers\RdKafkaProducerDriver;
 use Order\KafkaMessaging\PdoIdempotencyStore;
 
 /**
@@ -32,8 +33,8 @@ final class KafkaMessagingServiceProvider extends ServiceProvider
         $this->app->singleton(ProducerDriverInterface::class, function ($app) {
             return match ($app['config']['kafka-messaging.driver']) {
                 'memory' => new InMemoryProducerDriver(),
-                'rdkafka' => throw new \RuntimeException(
-                    'rdkafka driver is not wired yet — Phase 0 step 2 (requires ext-rdkafka).'
+                'rdkafka' => new RdKafkaProducerDriver(
+                    (string) $app['config']['kafka-messaging.brokers'],
                 ),
                 default => new LogProducerDriver($app['log']),
             };
