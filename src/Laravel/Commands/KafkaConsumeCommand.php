@@ -34,7 +34,8 @@ final class KafkaConsumeCommand extends Command
         {--retry : Consume the retry topics of the configured topics, honoring delays}
         {--max-messages= : Stop after N messages (default: run forever)}
         {--idle-exit : Exit on first idle poll instead of running as a daemon}
-        {--poll-timeout=5000 : Poll timeout in ms (must exceed group-rebalance time when using --idle-exit)}';
+        {--poll-timeout=5000 : Poll timeout in ms (must exceed group-rebalance time when using --idle-exit)}
+        {--shadow : Phase-2 shadow consume — runs as "<group>-shadow", logs what each handler WOULD do, executes nothing}';
 
     protected $description = 'Run the Kafka consumer daemon (order/kafka-messaging)';
 
@@ -59,6 +60,14 @@ final class KafkaConsumeCommand extends Command
             return self::FAILURE;
         }
 
+        // Shadow (04-migration-runbook Phase 2): a SEPARATE consumer group so
+        // shadow offsets/idempotency never pollute the real group's state,
+        // and handlers are replaced by observation logs — zero side effects.
+        $shadow = (bool) $this->option('shadow');
+        if ($shadow) {
+            $group .= '-shadow';
+        }
+
         $retryMode = (bool) $this->option('retry');
         if ($retryMode) {
             $topics = array_map(static fn (string $t): string => "{$group}.{$t}.retry", $topics);
@@ -75,7 +84,21 @@ final class KafkaConsumeCommand extends Command
             $consumer->honorRetryDelays();
         }
 
+        $logger = $this->laravel['log'];
         foreach ((array) ($config['consumer']['handlers'] ?? []) as $eventType => $handlerClass) {
+            if ($shadow) {
+                $consumer->onEvent((string) $eventType, static function (Envelope $e) use ($logger, $handlerClass): void {
+                    $logger->info('Kafka shadow consume — would handle', ['data' => [
+                        'event_type' => $e->eventType,
+                        'tenant' => $e->tenant,
+                        'message_id' => $e->messageId,
+                        'source_service' => $e->sourceService,
+                        'handler' => $handlerClass,
+                    ]]);
+                });
+                continue;
+            }
+
             $handler = $this->laravel->make($handlerClass);
             $callable = method_exists($handler, 'handle') ? [$handler, 'handle'] : $handler;
             $consumer->onEvent((string) $eventType, static fn (Envelope $e) => $callable($e));
@@ -89,7 +112,7 @@ final class KafkaConsumeCommand extends Command
             pcntl_signal(SIGINT, static fn () => $consumer->stop());
         }
 
-        $mode = $retryMode ? 'retry daemon' : 'daemon';
+        $mode = ($retryMode ? 'retry daemon' : 'daemon') . ($shadow ? ' · SHADOW' : '');
         $this->info("kafka:consume [{$mode}] group={$group} topics=" . implode(',', $topics));
 
         $max = $this->option('max-messages') !== null ? (int) $this->option('max-messages') : null;
