@@ -34,7 +34,7 @@ final class KafkaReconcileCommand extends Command
         {--since= : Only count events at or after this time (any strtotime-able value)}
         {--gateway-log= : Path to the gateway log carrying the SNS delivery trace}
         {--limit=5000 : Maximum messages to read per topic}
-        {--poll-timeout=5000 : Poll timeout in ms}';
+        {--poll-timeout=1500 : Poll timeout in ms — reconcile reads many topics, so it idles out faster than the daemon}';
 
     protected $description = 'Compare Kafka volume against what SNS actually delivered (migration phase-1 gate)';
 
@@ -86,51 +86,58 @@ final class KafkaReconcileCommand extends Command
     {
         $limit = max(1, (int) $this->option('limit'));
         $pollTimeout = (int) $this->option('poll-timeout');
-        $counts = [];
 
+        $counts = [];
         foreach ($topics as $topic) {
             $counts[$topic] = [];
-
-            $conf = new \RdKafka\Conf();
-            foreach ($broker->toLibrdKafkaConf() as $k => $v) {
-                $conf->set($k, $v);
-            }
-            // Throwaway group + no commit: reconciliation is an observation, it
-            // must never move a live consumer's position.
-            $conf->set('group.id', 'reconcile-' . substr(sha1($topic . microtime(true)), 0, 12));
-            $conf->set('enable.auto.commit', 'false');
-            $conf->set('auto.offset.reset', 'earliest');
-
-            $consumer = new \RdKafka\KafkaConsumer($conf);
-            $consumer->subscribe([$topic]);
-
-            $read = 0;
-            $idle = 0;
-            while ($read < $limit && $idle < 3) {
-                $message = $consumer->consume($pollTimeout);
-                if ($message->err !== RD_KAFKA_RESP_ERR_NO_ERROR) {
-                    $idle++;
-                    continue;
-                }
-                $idle = 0;
-                $read++;
-
-                if ($since !== null && (int) ($message->timestamp / 1000) < $since) {
-                    continue;
-                }
-
-                $eventType = '(no event_type)';
-                foreach ($message->headers ?? [] as $name => $value) {
-                    if ((string) $name === 'event_type') {
-                        $eventType = (string) $value;
-                    }
-                }
-
-                $counts[$topic][$eventType] = ($counts[$topic][$eventType] ?? 0) + 1;
-            }
-
-            $consumer->unsubscribe();
         }
+
+        $conf = new \RdKafka\Conf();
+        foreach ($broker->toLibrdKafkaConf() as $k => $v) {
+            $conf->set($k, $v);
+        }
+        // Throwaway group + no commit: reconciliation is an observation, it must
+        // never move a live consumer's position.
+        $conf->set('group.id', 'reconcile-' . substr(sha1(implode(',', $topics) . microtime(true)), 0, 12));
+        $conf->set('enable.auto.commit', 'false');
+        $conf->set('auto.offset.reset', 'earliest');
+
+        // ONE subscription across every topic. Subscribing per topic would pay a
+        // group join + rebalance each time, which dominates the runtime when
+        // most topics are empty.
+        $consumer = new \RdKafka\KafkaConsumer($conf);
+        $consumer->subscribe($topics);
+
+        $this->output->write('  reading ' . count($topics) . ' topic(s) ... ');
+
+        $read = 0;
+        $idle = 0;
+        while ($read < $limit && $idle < 3) {
+            $message = $consumer->consume($pollTimeout);
+            if ($message->err !== RD_KAFKA_RESP_ERR_NO_ERROR) {
+                $idle++;
+                continue;
+            }
+            $idle = 0;
+            $read++;
+
+            if ($since !== null && (int) ($message->timestamp / 1000) < $since) {
+                continue;
+            }
+
+            $eventType = '(no event_type)';
+            foreach ($message->headers ?? [] as $name => $value) {
+                if ((string) $name === 'event_type') {
+                    $eventType = (string) $value;
+                }
+            }
+
+            $topic = (string) $message->topic_name;
+            $counts[$topic][$eventType] = ($counts[$topic][$eventType] ?? 0) + 1;
+        }
+
+        $consumer->unsubscribe();
+        $this->output->writeln($read . ' message(s)');
 
         return $counts;
     }
