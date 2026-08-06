@@ -41,6 +41,13 @@ final class KafkaReconcileCommand extends Command
     /** A subscriber URI is http://host/api/v1/<service>/… — that segment names the endpoint. */
     private const URI_SERVICE = '#https?://[^/]+/api/v\d+/([^/?]+)#';
 
+    /**
+     * True when the log carried the harness branch's verbose trace, which
+     * records successes too. Without it the SNS side is failures-only and the
+     * totals must not be read as "attempts".
+     */
+    private bool $sawVerboseTrace = false;
+
     public function handle(): int
     {
         if (!extension_loaded('rdkafka')) {
@@ -168,7 +175,16 @@ final class KafkaReconcileCommand extends Command
         }
 
         while (($line = fgets($fh)) !== false) {
-            if (!str_contains($line, 'subscriber POST done')) {
+            // Two log shapes, because the gateway has two:
+            //   "SNS delivery failed"   — the master line. Logged for every
+            //       non-2xx, always on. Successes are not logged at all, so
+            //       this side yields losses only, never a total.
+            //   "subscriber POST done"  — the local-harness branch's verbose
+            //       trace (SNS_DEBUG_LOGS=true), which records every attempt
+            //       with its status, successes included.
+            $failedOnly = str_contains($line, 'SNS delivery failed');
+            $verbose = str_contains($line, 'subscriber POST done');
+            if (!$failedOnly && !$verbose) {
                 continue;
             }
             if ($since !== null && preg_match('#^\[([^\]]+)\]#', $line, $ts) === 1) {
@@ -177,14 +193,24 @@ final class KafkaReconcileCommand extends Command
                     continue;
                 }
             }
-            if (preg_match('#"uri":"([^"]+)"#', $line, $u) !== 1
-                || preg_match('#"status":(\d+)#', $line, $s) !== 1) {
+            if (preg_match('#"status":(\d+)#', $line, $s) !== 1) {
                 continue;
             }
 
-            $uri = $u[1];
+            // The verbose trace carries a uri; the master line carries the
+            // subscriber's service name and the subject instead.
+            if (preg_match('#"uri":"([^"]+)"#', $line, $u) === 1) {
+                $uri = $u[1];
+                $service = preg_match(self::URI_SERVICE, $uri, $m) === 1 ? $m[1] : $uri;
+            } else {
+                $svc = preg_match('#"service":"([^"]+)"#', $line, $m) === 1 ? $m[1] : '(unknown)';
+                $subject = preg_match('#"subject":"([^"]+)"#', $line, $m) === 1 ? $m[1] : '?';
+                $service = $svc;
+                $uri = "{$svc} ← {$subject}";
+            }
+
             $status = (int) $s[1];
-            $service = preg_match(self::URI_SERVICE, $uri, $m) === 1 ? $m[1] : $uri;
+            $this->sawVerboseTrace = $this->sawVerboseTrace || $verbose;
 
             $delivered[$service][$status] = ($delivered[$service][$status] ?? 0) + 1;
 
@@ -228,10 +254,14 @@ final class KafkaReconcileCommand extends Command
     private function renderSns(array $sns): void
     {
         $this->newLine();
-        $this->info('SNS — what the gateway actually delivered, per subscriber');
+        $this->info($this->sawVerboseTrace
+            ? 'SNS — what the gateway actually delivered, per subscriber'
+            : 'SNS — deliveries the gateway recorded as FAILED (successes are not logged)');
 
         if ($sns === []) {
-            $this->line('  (nothing — is SNS_DEBUG_LOGS=true in the gateway environment?)');
+            $this->line('  (nothing found — either no deliveries failed in this window,');
+            $this->line('   or the log path is wrong. For per-attempt detail including');
+            $this->line("   successes, the gateway needs its verbose SNS trace enabled.)");
 
             return;
         }
@@ -253,7 +283,7 @@ final class KafkaReconcileCommand extends Command
                 $ok,
                 $bad,
                 implode(', ', $detail),
-                $bad > 0 ? '   <-- COUNTED AS DELIVERED' : ''
+                $bad > 0 ? '   <-- NOT RETRIED, NOT DEAD-LETTERED' : ''
             ));
         }
     }
@@ -278,13 +308,17 @@ final class KafkaReconcileCommand extends Command
         $this->newLine();
         $this->info('THE GAP');
         $this->line(sprintf('  %-34s %d', 'Kafka messages written', $kafkaTotal));
-        $this->line(sprintf('  %-34s %d', 'SNS delivery attempts', $snsTotal));
-        $this->line(sprintf('  %-34s %d', '...of which answered 4xx/5xx', count($silent)));
+        $this->line(sprintf(
+            '  %-34s %d',
+            $this->sawVerboseTrace ? 'SNS delivery attempts' : 'SNS deliveries logged (failures only)',
+            $snsTotal
+        ));
+        $this->line(sprintf('  %-34s %d', '...answered 4xx/5xx', count($silent)));
 
         if ($silent !== []) {
             $this->newLine();
-            $this->line('  Not retried and not dropped loudly — http_errors => false treats');
-            $this->line('  these as success. This is the loss the migration removes:');
+            $this->line('  Logged, but never retried and never dead-lettered — the delivery');
+            $this->line('  simply ends here. This is the loss the migration removes:');
             foreach (array_slice($silent, 0, 15) as $row) {
                 $this->line(sprintf('    %d  %-20s %s', $row['status'], $row['service'], $row['uri']));
             }
@@ -297,5 +331,10 @@ final class KafkaReconcileCommand extends Command
         $this->line('  One Kafka message per PUBLISHED event; one SNS row per SUBSCRIBER.');
         $this->line('  A topic with N subscribers yields N SNS rows for one event —');
         $this->line('  compare the shapes, not the raw totals.');
+
+        if (!$this->sawVerboseTrace) {
+            $this->line('  Successes are not logged on this gateway line, so the SNS column');
+            $this->line('  is a floor on the loss, not a delivery count.');
+        }
     }
 }
