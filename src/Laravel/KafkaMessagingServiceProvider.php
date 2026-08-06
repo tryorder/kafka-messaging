@@ -95,6 +95,7 @@ final class KafkaMessagingServiceProvider extends ServiceProvider
             $this->commands([
                 Commands\KafkaConsumeCommand::class,
                 Commands\KafkaReplayCommand::class,
+                Commands\KafkaReconcileCommand::class,
             ]);
         }
     }
