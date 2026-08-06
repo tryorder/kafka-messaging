@@ -50,7 +50,7 @@ This library implements the target architecture from the migration plan:
 
 ```bash
 composer config repositories.kafka-messaging '{"type":"vcs","url":"git@github.com:tryorder/kafka-messaging.git"}'
-composer require order/kafka-messaging:^0.2.0
+composer require order/kafka-messaging:^0.4.0
 ```
 
 In Laravel the service provider is auto-discovered. Publish the configuration file if you need to customise it:
@@ -187,6 +187,21 @@ php artisan kafka:consume --shadow         # observe only, no side effects
 ```
 
 Handlers are resolved from the container; both `handle(Envelope $e)` and `__invoke(Envelope $e)` are supported. `SIGTERM`/`SIGINT` finish the in-flight message, commit it, and exit cleanly.
+
+An event type with no handler is acknowledged and skipped — topics carry many event types and each consumer handles a subset.
+
+#### Catch-all consumers
+
+A consumer whose routing is data-driven rather than code-driven can register a **fallback** with the `'*'` key (or `onAnyEvent()` on the fluent builder). An exact-match handler always wins, so the two compose:
+
+```php
+'handlers' => [
+    'OrderCreatedEvent' => \App\Kafka\Handlers\OrderCreatedHandler::class,  // wins for this type
+    '*'                 => \App\Kafka\Handlers\CatchAllHandler::class,      // everything else
+],
+```
+
+Use this when enumerating event types in configuration would be a correctness bug rather than a chore — a fan-out service that validates events against a catalog table, for example, must not silently drop a newly catalogued event.
 
 **Middleware** wraps handler execution — useful for tenant context, logging, timing, or skipping messages:
 
@@ -357,7 +372,7 @@ $envelope = SnsBridge::toEnvelope($subject, $decodedSnsMessage, 'service-order',
 | `extra_conf` | — | `[]` | Raw `librdkafka` overrides |
 | `consumer.group` | `KAFKA_CONSUMER_GROUP` | — | e.g. `svc-payment` |
 | `consumer.topics` | — | `[]` | Subscribed topics |
-| `consumer.handlers` | — | `[]` | `event_type => handler class` |
+| `consumer.handlers` | — | `[]` | `event_type => handler class`; the `'*'` key registers a fallback for every unclaimed type |
 | `idempotency.store` | `KAFKA_IDEMPOTENCY_STORE` | `pdo` | `pdo`, `memory` |
 | `idempotency.table` | `KAFKA_IDEMPOTENCY_TABLE` | `processed_messages` | Table name |
 

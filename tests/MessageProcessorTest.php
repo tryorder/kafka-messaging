@@ -54,6 +54,53 @@ final class MessageProcessorTest extends TestCase
         $this->assertSame(ProcessOutcome::NoHandler, $processor->process($this->message()));
     }
 
+    public function testFallbackHandlerReceivesUnclaimedEventTypes(): void
+    {
+        $seen = [];
+        $processor = new MessageProcessor('svc-webhook');
+        $processor->onAnyEvent(function (Envelope $e) use (&$seen): void {
+            $seen[] = $e->eventType;
+        });
+
+        $this->assertSame(ProcessOutcome::Processed, $processor->process($this->message()));
+        $this->assertSame(['OrderCreatedEvent'], $seen);
+
+        // A type the consumer has never heard of still reaches the fallback —
+        // that is the whole point for catalog-driven consumers.
+        $unknown = Envelope::create('jabourih', ['x' => 1], 'SomeBrandNewEvent', 'service-order');
+        $this->assertSame(ProcessOutcome::Processed, $processor->process($this->message($unknown)));
+        $this->assertSame(['OrderCreatedEvent', 'SomeBrandNewEvent'], $seen);
+    }
+
+    public function testExactHandlerWinsOverFallback(): void
+    {
+        $calls = [];
+        $processor = new MessageProcessor('svc-webhook');
+        $processor->onEvent('OrderCreatedEvent', function () use (&$calls): void {
+            $calls[] = 'exact';
+        });
+        $processor->onAnyEvent(function () use (&$calls): void {
+            $calls[] = 'fallback';
+        });
+
+        $processor->process($this->message());
+        $this->assertSame(['exact'], $calls);
+
+        $other = Envelope::create('jabourih', ['x' => 1], 'OrderCompletedEvent', 'service-order');
+        $processor->process($this->message($other));
+        $this->assertSame(['exact', 'fallback'], $calls);
+    }
+
+    public function testFallbackIsNotRegisteredByDefault(): void
+    {
+        // Guard for the 13 services already running: without onAnyEvent(), an
+        // unclaimed event type must still be skipped, never swallowed.
+        $processor = new MessageProcessor('svc-payment');
+        $processor->onEvent('RefundRequestedEvent', fn () => throw new \LogicException('must not run'));
+
+        $this->assertSame(ProcessOutcome::NoHandler, $processor->process($this->message()));
+    }
+
     public function testImmediateRetriesBeforeEscalation(): void
     {
         $attempts = 0;

@@ -78,6 +78,9 @@ final class KafkaConsumer
     }
 
     /**
+     * Register a handler for one event type, or pass MessageProcessor::ANY_EVENT
+     * ('*') to register the fallback — see onAnyEvent().
+     *
      * @param callable(Envelope): void $handler
      */
     public function onEvent(string $eventType, callable $handler): self
@@ -85,6 +88,17 @@ final class KafkaConsumer
         $this->handlers[$eventType] = $handler;
 
         return $this;
+    }
+
+    /**
+     * Handle every event type that has no handler of its own. An exact-match
+     * handler always wins. See MessageProcessor::onAnyEvent().
+     *
+     * @param callable(Envelope): void $handler
+     */
+    public function onAnyEvent(callable $handler): self
+    {
+        return $this->onEvent(MessageProcessor::ANY_EVENT, $handler);
     }
 
     /**

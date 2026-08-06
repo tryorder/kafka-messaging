@@ -39,6 +39,9 @@ final class MessageProcessor
     public const HEADER_ORIGINAL_TOPIC = 'x-original-topic';
     public const HEADER_LAST_ERROR = 'x-last-error';
 
+    /** Handler key meaning "any event type without its own handler". */
+    public const ANY_EVENT = '*';
+
     /** @var array<string, callable(Envelope): void> */
     private array $handlers = [];
 
@@ -58,6 +61,9 @@ final class MessageProcessor
     }
 
     /**
+     * Register a handler for one event type, or pass self::ANY_EVENT ('*') to
+     * register the fallback — see onAnyEvent().
+     *
      * @param callable(Envelope): void $handler
      */
     public function onEvent(string $eventType, callable $handler): self
@@ -65,6 +71,23 @@ final class MessageProcessor
         $this->handlers[$eventType] = $handler;
 
         return $this;
+    }
+
+    /**
+     * Handle every event type that has no handler of its own.
+     *
+     * For generic consumers whose routing is data-driven rather than
+     * code-driven — service-webhook is the case this exists for: it validates
+     * the event against a catalog table and fans out, so enumerating event
+     * types in config would silently drop any newly catalogued event.
+     *
+     * An exact-match handler always wins, so this composes with onEvent().
+     *
+     * @param callable(Envelope): void $handler
+     */
+    public function onAnyEvent(callable $handler): self
+    {
+        return $this->onEvent(self::ANY_EVENT, $handler);
     }
 
     /**
@@ -127,7 +150,9 @@ final class MessageProcessor
             return ProcessOutcome::Malformed;
         }
 
-        $handler = $this->handlers[$envelope->eventType] ?? null;
+        // Exact match first; the fallback (onAnyEvent) only ever applies to
+        // event types nothing else claimed.
+        $handler = $this->handlers[$envelope->eventType] ?? $this->handlers[self::ANY_EVENT] ?? null;
         if ($handler === null) {
             // Not an error: topics carry many event types and each consumer
             // handles a subset — everything else is acknowledged and skipped.
