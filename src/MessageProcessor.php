@@ -130,7 +130,7 @@ final class MessageProcessor
         $originalTopic = $message->headers[self::HEADER_ORIGINAL_TOPIC] ?? $message->topic;
 
         try {
-            $envelope = Envelope::fromConsumed($message->headers, $message->payload);
+            $envelope = Envelope::fromConsumed($message->headers, $message->payload, $message->topic);
         } catch (\Throwable $e) {
             // Any parse failure — not only InvalidEnvelopeException — would
             // fail forever; parking it in the DLQ keeps the partition moving

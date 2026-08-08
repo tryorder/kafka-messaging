@@ -27,6 +27,15 @@ final class Envelope
         public readonly int $schemaVersion,
         public readonly string $sourceService,
         public readonly string $traceId,
+        /**
+         * The topic this message was READ from. Null on the produce side — it
+         * is not part of the wire format, it is where the message was found.
+         *
+         * Handlers need it because cutover is per topic: a consumer subscribed
+         * to many topics may be authoritative for one of them and still in
+         * shadow for the rest, and only the topic distinguishes them.
+         */
+        public readonly ?string $sourceTopic = null,
     ) {
     }
 
@@ -83,8 +92,9 @@ final class Envelope
      * treats that as "cannot dedupe" and logs it, rather than dropping).
      *
      * @param array<string, string> $headers
+     * @param string|null $sourceTopic The topic the message was read from, when known.
      */
-    public static function fromConsumed(array $headers, string $payloadJson): self
+    public static function fromConsumed(array $headers, string $payloadJson, ?string $sourceTopic = null): self
     {
         try {
             $payload = json_decode($payloadJson, true, 512, JSON_THROW_ON_ERROR);
@@ -123,6 +133,10 @@ final class Envelope
             schemaVersion: max(1, (int) ($headers['schema_version'] ?? 1)),
             sourceService: trim((string) ($headers['source_service'] ?? '')),
             traceId: trim((string) ($headers['trace_id'] ?? '')),
+            // Prefer the ORIGINAL topic: a message replayed from a retry or DLQ
+            // topic must still be judged as the topic it came from, not as
+            // "<group>.<topic>.retry".
+            sourceTopic: ($headers[MessageProcessor::HEADER_ORIGINAL_TOPIC] ?? null) ?: $sourceTopic,
         );
     }
 

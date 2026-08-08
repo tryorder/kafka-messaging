@@ -91,6 +91,44 @@ final class MessageProcessorTest extends TestCase
         $this->assertSame(['exact', 'fallback'], $calls);
     }
 
+    public function testHandlerSeesTheTopicTheMessageCameFrom(): void
+    {
+        // Cutover is per topic, so a catch-all handler must be able to tell
+        // which topic it is looking at.
+        $seen = [];
+        $processor = new MessageProcessor('svc-webhook');
+        $processor->onAnyEvent(function (Envelope $e) use (&$seen): void {
+            $seen[] = $e->sourceTopic;
+        });
+
+        $coupon = Envelope::create('jabourih', ['id' => 'cpn_1'], 'CouponCreatedEvent', 'service-promocodes');
+        $order = Envelope::create('jabourih', ['id' => 'ord_1'], 'OrderCreatedEvent', 'service-order');
+
+        $processor->process($this->message($coupon, topic: 'promocode.events'));
+        $processor->process($this->message($order, topic: 'order.events'));
+
+        $this->assertSame(['promocode.events', 'order.events'], $seen);
+    }
+
+    public function testRetriedMessageKeepsItsOriginalTopic(): void
+    {
+        // Read back off the retry topic, a message must still be judged as the
+        // topic it was published to — otherwise a retry would bypass a
+        // per-topic cutover gate.
+        $seen = null;
+        $processor = new MessageProcessor('svc-webhook');
+        $processor->onAnyEvent(function (Envelope $e) use (&$seen): void {
+            $seen = $e->sourceTopic;
+        });
+
+        $processor->process($this->message(
+            extraHeaders: [MessageProcessor::HEADER_ORIGINAL_TOPIC => 'promocode.events'],
+            topic: 'svc-webhook.promocode.events.retry'
+        ));
+
+        $this->assertSame('promocode.events', $seen);
+    }
+
     public function testFallbackIsNotRegisteredByDefault(): void
     {
         // Guard for the 13 services already running: without onAnyEvent(), an
