@@ -13,42 +13,132 @@ use Order\KafkaMessaging\Contracts\IdempotencyStoreInterface;
  * Portable across MySQL/Postgres/SQLite by design: markProcessed() attempts a
  * plain INSERT and treats a duplicate-key violation (SQLSTATE 23xxx) as
  * "already marked" — no dialect-specific UPSERT needed.
+ *
+ * ── CONNECTIONS OUTLIVE THIS OBJECT'S ASSUMPTIONS ────────────────────────────
+ * A consumer daemon runs for days and idles between messages, so the database
+ * closes the connection under it. Accepting a \PDO handle and holding it meant
+ * the store kept using a dead one: the framework reconnects transparently for
+ * its own queries, so the handler succeeded and only the mark failed — the
+ * message was processed and never recorded as processed, which is the one
+ * combination that lets a redelivery run twice.
+ *
+ * Two changes fix it. The constructor also accepts a resolver, so the store
+ * asks for the current connection instead of remembering one; and every
+ * statement retries once on a lost connection after dropping the cached handle,
+ * because a resolver alone still returns the stale object when nothing has
+ * forced a reconnect yet.
  */
 final class PdoIdempotencyStore implements IdempotencyStoreInterface
 {
+    /** @var \PDO|(\Closure(): \PDO) */
+    private $connection;
+
+    private ?\PDO $resolved = null;
+
+    /**
+     * @param \PDO|(\Closure(): \PDO) $pdo A handle, or a resolver returning the
+     *        current one. Prefer the resolver anywhere the connection can be
+     *        replaced under you — which is every long-running consumer.
+     */
     public function __construct(
-        private readonly \PDO $pdo,
+        \PDO|\Closure $pdo,
         private readonly string $table = 'processed_messages',
     ) {
         if (!preg_match('/^[A-Za-z0-9_]+$/', $table)) {
             throw new \InvalidArgumentException('Invalid idempotency table name.');
         }
+
+        $this->connection = $pdo;
     }
 
     public function wasProcessed(string $consumerGroup, string $messageId): bool
     {
-        $stmt = $this->pdo->prepare(
-            "SELECT 1 FROM {$this->table} WHERE consumer_group = ? AND message_id = ? LIMIT 1"
-        );
-        $stmt->execute([$consumerGroup, $messageId]);
+        return $this->run(function (\PDO $pdo) use ($consumerGroup, $messageId): bool {
+            $stmt = $pdo->prepare(
+                "SELECT 1 FROM {$this->table} WHERE consumer_group = ? AND message_id = ? LIMIT 1"
+            );
+            $stmt->execute([$consumerGroup, $messageId]);
 
-        return $stmt->fetchColumn() !== false;
+            return $stmt->fetchColumn() !== false;
+        });
     }
 
     public function markProcessed(string $consumerGroup, string $messageId): void
     {
-        $stmt = $this->pdo->prepare(
-            "INSERT INTO {$this->table} (consumer_group, message_id, processed_at) VALUES (?, ?, ?)"
-        );
+        $this->run(function (\PDO $pdo) use ($consumerGroup, $messageId): void {
+            $stmt = $pdo->prepare(
+                "INSERT INTO {$this->table} (consumer_group, message_id, processed_at) VALUES (?, ?, ?)"
+            );
 
+            try {
+                $stmt->execute([$consumerGroup, $messageId, gmdate('Y-m-d\TH:i:s\Z')]);
+            } catch (\PDOException $e) {
+                // Duplicate key (concurrent consumer marked it first) = success.
+                if (!str_starts_with((string) $e->getCode(), '23')) {
+                    throw $e;
+                }
+            }
+        });
+    }
+
+    /**
+     * Run a statement, and retry it once against a freshly resolved connection
+     * when the failure was the connection itself rather than the statement.
+     *
+     * Only once: a second lost connection is a real outage, and retrying past
+     * that would stall the consumer on a broker whose messages keep arriving.
+     */
+    private function run(callable $fn): mixed
+    {
         try {
-            $stmt->execute([$consumerGroup, $messageId, gmdate('Y-m-d\TH:i:s\Z')]);
+            return $fn($this->pdo());
         } catch (\PDOException $e) {
-            // Duplicate key (concurrent consumer marked it first) = success.
-            if (!str_starts_with((string) $e->getCode(), '23')) {
+            if (!$this->isLostConnection($e) || $this->connection instanceof \PDO) {
+                // A bare handle cannot be re-resolved — nothing to retry with.
                 throw $e;
             }
+
+            $this->resolved = null;
+
+            return $fn($this->pdo());
         }
+    }
+
+    private function pdo(): \PDO
+    {
+        if ($this->connection instanceof \PDO) {
+            return $this->connection;
+        }
+
+        return $this->resolved ??= ($this->connection)();
+    }
+
+    /**
+     * Driver messages rather than SQLSTATE: MySQL reports a dropped connection
+     * as HY000/2006 and Postgres as 08006, but both also use those codes for
+     * faults a retry cannot fix, so the text is what actually distinguishes them.
+     */
+    private function isLostConnection(\PDOException $e): bool
+    {
+        $message = $e->getMessage();
+
+        foreach ([
+            'server has gone away',
+            'Lost connection',
+            'no connection to the server',
+            'Error while sending',
+            'SSL connection has been closed unexpectedly',
+            'Connection refused',
+            'server closed the connection unexpectedly',
+            'connection is no longer usable',
+            'Broken pipe',
+        ] as $needle) {
+            if (stripos($message, $needle) !== false) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**

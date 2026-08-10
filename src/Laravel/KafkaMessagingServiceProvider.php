@@ -77,8 +77,16 @@ final class KafkaMessagingServiceProvider extends ServiceProvider
         $this->app->singleton(IdempotencyStoreInterface::class, function ($app) {
             return match ($app['config']['kafka-messaging.idempotency.store']) {
                 'memory' => new InMemoryIdempotencyStore(),
+                // A resolver, not a handle. This store is a singleton inside a
+                // daemon that outlives its database connection: passing the PDO
+                // pinned the one that existed at boot, so once the server closed
+                // it the framework reconnected for the handler's own queries
+                // while the store kept writing through a dead handle. The mark
+                // then failed after the work had already succeeded — a message
+                // processed but never recorded, which is exactly the state a
+                // redelivery re-runs.
                 default => new PdoIdempotencyStore(
-                    $app['db']->connection()->getPdo(),
+                    fn (): \PDO => $app['db']->connection()->getPdo(),
                     (string) $app['config']['kafka-messaging.idempotency.table'],
                 ),
             };
