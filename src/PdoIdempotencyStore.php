@@ -27,6 +27,13 @@ use Order\KafkaMessaging\Contracts\IdempotencyStoreInterface;
  * statement retries once on a lost connection after dropping the cached handle,
  * because a resolver alone still returns the stale object when nothing has
  * forced a reconnect yet.
+ *
+ * Dropping the cached handle turned out not to be that force. Under Laravel the
+ * resolver is getPdo(), which returns whatever the connection is holding with no
+ * liveness check, so the retry resolved the very same dead handle and failed the
+ * same way. On stage a Postgres restart (2026-09-11 04:50 UTC) left long-running
+ * consumers processing without dedupe until they were restarted. So the retry
+ * now asks the owner of the connection to replace it first, through $reconnect.
  */
 final class PdoIdempotencyStore implements IdempotencyStoreInterface
 {
@@ -39,10 +46,14 @@ final class PdoIdempotencyStore implements IdempotencyStoreInterface
      * @param \PDO|(\Closure(): \PDO) $pdo A handle, or a resolver returning the
      *        current one. Prefer the resolver anywhere the connection can be
      *        replaced under you — which is every long-running consumer.
+     * @param (\Closure(): mixed)|null $reconnect Replaces the underlying
+     *        connection before the retry. Required whenever the resolver can
+     *        hand back a handle it has not checked, as Laravel's getPdo() does.
      */
     public function __construct(
         \PDO|\Closure $pdo,
         private readonly string $table = 'processed_messages',
+        private readonly ?\Closure $reconnect = null,
     ) {
         if (!preg_match('/^[A-Za-z0-9_]+$/', $table)) {
             throw new \InvalidArgumentException('Invalid idempotency table name.');
@@ -99,6 +110,10 @@ final class PdoIdempotencyStore implements IdempotencyStoreInterface
             }
 
             $this->resolved = null;
+
+            if ($this->reconnect !== null) {
+                ($this->reconnect)();
+            }
 
             return $fn($this->pdo());
         }
