@@ -88,6 +88,9 @@ final class KafkaMessagingServiceProvider extends ServiceProvider
                 default => new PdoIdempotencyStore(
                     fn (): \PDO => $app['db']->connection()->getPdo(),
                     (string) $app['config']['kafka-messaging.idempotency.table'],
+                    // getPdo() never checks the handle it returns, so without
+                    // this the retry resolves the same dead connection again.
+                    fn () => $app['db']->connection()->reconnect(),
                 ),
             };
         });

@@ -117,4 +117,63 @@ final class PdoIdempotencyStoreTest extends TestCase
         $this->assertTrue($store->wasProcessed('svc-order', 'msg-bare'));
     }
 
+    /**
+     * What Laravel actually does: getPdo() hands back the connection it is
+     * holding with no liveness check, so asking the resolver again returns the
+     * very same dead handle until something calls reconnect(). The resolver in
+     * testResolverIsAskedAgainAfterAConnectionIsLost is kinder than the
+     * framework, which is how this slipped through.
+     */
+    public function testReconnectsWhenTheResolverKeepsReturningTheSameDeadHandle(): void
+    {
+        $dead = new class('sqlite::memory:') extends \PDO {
+            public function prepare(string $query, array $options = []): \PDOStatement|false
+            {
+                throw new \PDOException('SQLSTATE[HY000]: General error: 7 no connection to the server');
+            }
+        };
+
+        $current = $dead;
+        $reconnects = 0;
+
+        $store = new PdoIdempotencyStore(
+            function () use (&$current): \PDO {
+                return $current;
+            },
+            'processed_messages',
+            function () use (&$current, &$reconnects): void {
+                $reconnects++;
+                $current = $this->pdo;
+            },
+        );
+
+        $store->markProcessed('svc-menu', 'msg-same-dead-handle');
+
+        $this->assertSame(1, $reconnects, 'a lost connection must force a reconnect before the retry');
+        $this->assertTrue($store->wasProcessed('svc-menu', 'msg-same-dead-handle'));
+    }
+
+    public function testNoReconnectForAFailureThatIsNotAConnectionLoss(): void
+    {
+        $reconnects = 0;
+        $store = new PdoIdempotencyStore(
+            fn (): \PDO => new class('sqlite::memory:') extends \PDO {
+                public function prepare(string $query, array $options = []): \PDOStatement|false
+                {
+                    throw new \PDOException('SQLSTATE[42S02]: Base table or view not found');
+                }
+            },
+            'processed_messages',
+            function () use (&$reconnects): void {
+                $reconnects++;
+            },
+        );
+
+        try {
+            $store->markProcessed('svc-menu', 'msg-schema');
+            $this->fail('a schema error must surface');
+        } catch (\PDOException) {
+            $this->assertSame(0, $reconnects, 'only a lost connection may trigger a reconnect');
+        }
+    }
 }
